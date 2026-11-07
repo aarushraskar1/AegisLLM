@@ -1,606 +1,115 @@
-//! Core AegisLLM library.
-//!
-//! This first repository implementation provides a bounded, opt-in semantic
-//! cache; a typed OpenAI-compatible chat proxy; controlled fault responses; and
-//! a non-blocking metrics snapshot/event interface. ONNX model loading is kept
-//! behind [`EmbeddingBackend`], so the application can load and validate the
-//! selected model at startup without coupling this core to a particular ONNX
-//! Runtime release or model export signature.
+//! AegisLLM library: local embeddings, semantic cache, fault policies,
+//! OpenAI-compatible proxy, and asynchronous observability interfaces.
+pub mod fault;
+pub mod observability;
+pub mod proxy;
+pub mod semantic;
+pub mod vector_db;
 
-use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::{Duration, Instant, SystemTime},
-};
-
-use axum::{
-    body::{Body, Bytes},
-    extract::{DefaultBodyLimit, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
-    routing::{get, post},
-    Json, Router,
-};
-use dashmap::DashMap;
-use futures_util::StreamExt;
+use std::{sync::Arc, time::Duration};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
+use tokio::sync::{broadcast, watch};
 use thiserror::Error;
-use tokio::{sync::{broadcast, watch}, task};
 
+pub use fault::{FaultConfig, FaultKind};
+pub use observability::{Metrics, MetricsSnapshot, OperationalEvent};
+pub use proxy::{router, ChatCompletionRequest, ChatMessage};
+pub use semantic::{EmbeddingBackend, OrtEmbedder, SemanticEmbedder};
+pub use vector_db::{CacheHit, VectorStore, calculate_cosine_similarity};
 pub const EMBEDDING_DIMENSION: usize = 384;
-const FAULT_HEADER: &str = "x-aegis-fault-type";
-const FAULT_SECRET_HEADER: &str = "x-aegis-test-secret";
 
 #[derive(Debug, Error)]
 pub enum AegisError {
-    #[error("invalid configuration: {0}")]
-    Config(String),
-    #[error("invalid request: {0}")]
-    InvalidRequest(String),
-    #[error("embedding failed: {0}")]
-    Embedding(String),
-    #[error("upstream request failed: {0}")]
-    Upstream(#[from] reqwest::Error),
-    #[error("serialization failed: {0}")]
-    Serialization(#[from] serde_json::Error),
-    #[error("background worker failed: {0}")]
-    Worker(String),
+    #[error("configuration error: {0}")] Config(String),
+    #[error("invalid request: {0}")] InvalidRequest(String),
+    #[error("embedding failed: {0}")] Embedding(String),
+    #[error("upstream request failed: {0}")] Upstream(#[from] reqwest::Error),
+    #[error("serialization failed: {0}")] Serialization(#[from] serde_json::Error),
+    #[error("background task failed: {0}")] Worker(String),
+    #[error("I/O error: {0}")] Io(#[from] std::io::Error),
 }
 
-/// Configuration needed by this library's proxy and cache layers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize)]
 pub struct AegisConfig {
+    pub bind_addr: String,
     pub upstream_base_url: String,
-    /// Optional provider credential. Keep secrets out of source-controlled config.
     pub upstream_bearer_token: Option<String>,
     pub semantic_cache_enabled: bool,
     pub similarity_threshold: f32,
     pub max_cache_entries: usize,
-    pub cache_ttl: Duration,
+    pub cache_ttl_seconds: u64,
     pub max_request_bytes: usize,
-    pub request_timeout: Duration,
-    /// Fault injection is inert unless enabled and a secret is configured.
+    pub request_timeout_seconds: u64,
     pub fault_injection_enabled: bool,
     pub fault_injection_secret: Option<String>,
+    pub embedding_model_path: String,
+    pub tokenizer_path: String,
+    pub embedding_model_sha256: String,
+    pub tokenizer_sha256: String,
+    pub embedding_max_tokens: usize,
+    pub dashboard_enabled: bool,
 }
 
 impl Default for AegisConfig {
     fn default() -> Self {
         Self {
-            upstream_base_url: "https://api.openai.com".to_owned(),
+            bind_addr: "127.0.0.1:8080".into(),
+            upstream_base_url: "https://api.openai.com".into(),
             upstream_bearer_token: None,
             semantic_cache_enabled: false,
             similarity_threshold: 0.96,
             max_cache_entries: 10_000,
-            cache_ttl: Duration::from_secs(3_600),
+            cache_ttl_seconds: 3600,
             max_request_bytes: 2 * 1024 * 1024,
-            request_timeout: Duration::from_secs(120),
+            request_timeout_seconds: 120,
             fault_injection_enabled: false,
             fault_injection_secret: None,
+            embedding_model_path: "models/model.onnx".into(),
+            tokenizer_path: "models/tokenizer.json".into(),
+            embedding_model_sha256: String::new(),
+            tokenizer_sha256: String::new(),
+            embedding_max_tokens: 256,
+            dashboard_enabled: false,
         }
     }
 }
 
 impl AegisConfig {
     pub fn validate(&self) -> Result<(), AegisError> {
-        let parsed = reqwest::Url::parse(&self.upstream_base_url)
+        let url = reqwest::Url::parse(&self.upstream_base_url)
             .map_err(|e| AegisError::Config(format!("invalid upstream URL: {e}")))?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            return Err(AegisError::Config("upstream URL must use HTTP or HTTPS".into()));
-        }
-        if !self.similarity_threshold.is_finite()
-            || !(0.0..=1.0).contains(&self.similarity_threshold)
-        {
-            return Err(AegisError::Config("similarity threshold must be between 0 and 1".into()));
-        }
-        if self.max_cache_entries == 0 || self.max_request_bytes == 0 {
-            return Err(AegisError::Config("cache capacity and body limit must be nonzero".into()));
-        }
-        if self.request_timeout.is_zero() || self.cache_ttl.is_zero() {
-            return Err(AegisError::Config("timeouts and cache TTL must be nonzero".into()));
-        }
-        if self.fault_injection_enabled
-            && self.fault_injection_secret.as_deref().is_none_or(str::is_empty)
-        {
-            return Err(AegisError::Config(
-                "fault injection requires a non-empty test secret".into(),
-            ));
-        }
+        if !matches!(url.scheme(), "http" | "https") { return Err(AegisError::Config("upstream URL must use HTTP(S)".into())); }
+        if self.bind_addr.parse::<std::net::SocketAddr>().is_err() { return Err(AegisError::Config("bind_addr must be a socket address".into())); }
+        if !self.similarity_threshold.is_finite() || !(0.0..=1.0).contains(&self.similarity_threshold) { return Err(AegisError::Config("similarity threshold must be in [0,1]".into())); }
+        if self.max_cache_entries == 0 || self.max_request_bytes == 0 || self.embedding_max_tokens == 0 || self.cache_ttl_seconds == 0 || self.request_timeout_seconds == 0 { return Err(AegisError::Config("cache, body, token, and timeout limits must be nonzero".into())); }
+        if self.fault_injection_enabled && self.fault_injection_secret.as_deref().is_none_or(str::is_empty) { return Err(AegisError::Config("enabled fault injection requires a secret".into())); }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct MetricsSnapshot {
-    pub requests: u64,
-    pub cache_hits: u64,
-    pub cache_misses: u64,
-    pub last_latency_micros: u64,
-    pub estimated_savings_microusd: u64,
-}
-
-#[derive(Clone, Debug)]
-pub enum OperationalEvent {
-    CacheHit,
-    CacheMiss,
-    CacheInsert,
-    FaultInjected(&'static str),
-    UpstreamFailure,
-}
-
-/// Atomics keep request-side metric updates cheap; bounded channels avoid
-/// blocking network handlers when a dashboard is slow or not running.
-pub struct Metrics {
-    requests: AtomicU64,
-    hits: AtomicU64,
-    misses: AtomicU64,
-    latency_micros: AtomicU64,
-    savings_microusd: AtomicU64,
-    snapshot_tx: watch::Sender<MetricsSnapshot>,
-    events_tx: broadcast::Sender<OperationalEvent>,
-}
-
-impl Default for Metrics {
-    fn default() -> Self { Self::new() }
-}
-
-impl Metrics {
-    pub fn new() -> Self {
-        let (snapshot_tx, _) = watch::channel(MetricsSnapshot::default());
-        let (events_tx, _) = broadcast::channel(256);
-        Self {
-            requests: AtomicU64::new(0), hits: AtomicU64::new(0), misses: AtomicU64::new(0),
-            latency_micros: AtomicU64::new(0), savings_microusd: AtomicU64::new(0),
-            snapshot_tx, events_tx,
-        }
-    }
-
-    pub fn subscribe(&self) -> watch::Receiver<MetricsSnapshot> { self.snapshot_tx.subscribe() }
-    pub fn subscribe_events(&self) -> broadcast::Receiver<OperationalEvent> { self.events_tx.subscribe() }
-
-    fn record(&self, latency: Duration, hit: Option<bool>) {
-        self.requests.fetch_add(1, Ordering::Relaxed);
-        self.latency_micros.store(
-            latency.as_micros().min(u64::MAX as u128) as u64,
-            Ordering::Relaxed,
-        );
-        if let Some(is_hit) = hit {
-            if is_hit { self.hits.fetch_add(1, Ordering::Relaxed); }
-            else { self.misses.fetch_add(1, Ordering::Relaxed); }
-        }
-        self.publish();
-    }
-
-    pub fn add_estimated_savings_microusd(&self, amount: u64) {
-        self.savings_microusd.fetch_add(amount, Ordering::Relaxed);
-        self.publish();
-    }
-
-    fn publish(&self) {
-        self.snapshot_tx.send_replace(MetricsSnapshot {
-            requests: self.requests.load(Ordering::Relaxed),
-            cache_hits: self.hits.load(Ordering::Relaxed),
-            cache_misses: self.misses.load(Ordering::Relaxed),
-            last_latency_micros: self.latency_micros.load(Ordering::Relaxed),
-            estimated_savings_microusd: self.savings_microusd.load(Ordering::Relaxed),
-        });
-    }
-
-    fn event(&self, event: OperationalEvent) { let _ = self.events_tx.send(event); }
-}
-
-/// Implement this with the exact tokenizer, pooling, and ONNX graph contract
-/// for the deployed model. Inference is invoked on Tokio's blocking pool.
-pub trait EmbeddingBackend: Send + Sync + 'static {
-    fn embed_blocking(&self, normalized_text: &str) -> Result<Vec<f32>, AegisError>;
-}
-
-#[derive(Clone)]
-pub struct SemanticEmbedder {
-    backend: Arc<dyn EmbeddingBackend>,
-}
-
-impl SemanticEmbedder {
-    pub fn new(backend: Arc<dyn EmbeddingBackend>) -> Self { Self { backend } }
-
-    pub async fn embed(&self, text: &str) -> Result<Vec<f32>, AegisError> {
-        let normalized = normalize_text(text)?;
-        let backend = Arc::clone(&self.backend);
-        let vector = task::spawn_blocking(move || backend.embed_blocking(&normalized))
-            .await
-            .map_err(|e| AegisError::Worker(e.to_string()))??;
-        validate_embedding(&vector)?;
-        Ok(vector)
-    }
-}
-
-fn normalize_text(text: &str) -> Result<String, AegisError> {
-    let normalized = text.trim();
-    if normalized.is_empty() {
-        return Err(AegisError::InvalidRequest("prompt must not be empty".into()));
-    }
-    Ok(normalized.to_owned())
-}
-
-fn validate_embedding(vector: &[f32]) -> Result<(), AegisError> {
-    if vector.len() != EMBEDDING_DIMENSION {
-        return Err(AegisError::Embedding(format!(
-            "expected {EMBEDDING_DIMENSION} values, received {}", vector.len()
-        )));
-    }
-    if vector.iter().any(|value| !value.is_finite()) {
-        return Err(AegisError::Embedding("model returned a non-finite value".into()));
-    }
-    Ok(())
-}
-
-#[derive(Clone)]
-struct CacheEntry {
-    vector: Arc<[f32]>,
-    response: Bytes,
-    model: String,
-    policy_fingerprint: [u8; 32],
-    expires_at: Instant,
-    created_at: SystemTime,
-}
-
-#[derive(Clone, Debug)]
-pub struct CacheHit {
-    pub response: Bytes,
-    pub similarity: f32,
-}
-
-/// Concurrent semantic response cache. Cache policy compatibility is checked
-/// separately from prompt similarity so different generation settings cannot
-/// accidentally share an answer.
-pub struct VectorStore {
-    entries: DashMap<String, CacheEntry>,
-    max_entries: usize,
-    ttl: Duration,
-    threshold: f32,
-}
-
-impl VectorStore {
-    pub fn new(max_entries: usize, ttl: Duration, threshold: f32) -> Result<Self, AegisError> {
-        if max_entries == 0 || ttl.is_zero() || !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
-            return Err(AegisError::Config("invalid vector-store capacity, TTL, or threshold".into()));
-        }
-        Ok(Self { entries: DashMap::new(), max_entries, ttl, threshold })
-    }
-
-    pub fn len(&self) -> usize { self.entries.len() }
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
-
-    fn insert(&self, key: String, vector: Vec<f32>, response: Bytes, model: String, policy_fingerprint: [u8; 32]) {
-        self.entries.insert(key, CacheEntry {
-            vector: Arc::from(vector), response, model, policy_fingerprint,
-            expires_at: Instant::now() + self.ttl,
-            created_at: SystemTime::now(),
-        });
-        self.evict_expired_and_over_capacity();
-    }
-
-    fn query(&self, vector: &[f32], model: &str, fingerprint: &[u8; 32]) -> Option<CacheHit> {
-        let now = Instant::now();
-        let mut best: Option<CacheHit> = None;
-        for entry in self.entries.iter() {
-            let item = entry.value();
-            if item.expires_at <= now || item.model != model || item.policy_fingerprint != *fingerprint {
-                continue;
-            }
-            let similarity = calculate_cosine_similarity(vector, &item.vector);
-            if similarity >= self.threshold && best.as_ref().is_none_or(|current| similarity > current.similarity) {
-                best = Some(CacheHit { response: item.response.clone(), similarity });
-            }
-        }
-        best
-    }
-
-    fn evict_expired_and_over_capacity(&self) {
-        let now = Instant::now();
-        self.entries.retain(|_, entry| entry.expires_at > now);
-        while self.entries.len() > self.max_entries {
-            let oldest = self.entries.iter()
-                .min_by_key(|entry| entry.created_at)
-                .map(|entry| entry.key().clone());
-            match oldest {
-                Some(key) => { self.entries.remove(&key); }
-                None => break,
-            }
-        }
-    }
-}
-
-/// Scalar reference implementation; this contiguous loop is suitable for LLVM
-/// auto-vectorization and can serve as the correctness oracle for SIMD variants.
-pub fn calculate_cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() { return 0.0; }
-    let (mut dot, mut norm_a, mut norm_b) = (0.0_f32, 0.0_f32, 0.0_f32);
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        norm_a += x * x;
-        norm_b += y * y;
-    }
-    let denominator = norm_a.sqrt() * norm_b.sqrt();
-    if denominator <= f32::EPSILON || !denominator.is_finite() { 0.0 } else { dot / denominator }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: Value,
-}
-
-/// `extra` preserves provider fields we do not interpret, and is included in
-/// cache compatibility so unsupported generation options cannot be ignored.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChatCompletionRequest {
-    pub model: String,
-    pub messages: Vec<ChatMessage>,
-    #[serde(default)]
-    pub stream: bool,
-    #[serde(default)]
-    pub temperature: Option<f32>,
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, Value>,
-}
-
-#[derive(Clone)]
 pub struct AppState {
-    config: Arc<AegisConfig>,
-    embedder: Arc<SemanticEmbedder>,
-    vectors: Arc<VectorStore>,
-    upstream: Client,
-    metrics: Arc<Metrics>,
+    pub config: Arc<AegisConfig>,
+    pub embedder: Arc<SemanticEmbedder>,
+    pub vectors: Arc<VectorStore>,
+    pub upstream: Client,
+    pub metrics: Arc<Metrics>,
+    pub faults: FaultConfig,
 }
 
 impl AppState {
     pub fn new(config: AegisConfig, embedder: SemanticEmbedder) -> Result<Self, AegisError> {
         config.validate()?;
-        let client = Client::builder()
-            .connect_timeout(config.request_timeout.min(Duration::from_secs(10)))
-            .timeout(config.request_timeout)
+        let upstream = Client::builder()
+            .connect_timeout(Duration::from_secs(config.request_timeout_seconds.min(10)))
+            .timeout(Duration::from_secs(config.request_timeout_seconds))
             .pool_max_idle_per_host(32)
             .build()?;
-        let vectors = VectorStore::new(config.max_cache_entries, config.cache_ttl, config.similarity_threshold)?;
-        Ok(Self {
-            config: Arc::new(config), embedder: Arc::new(embedder),
-            vectors: Arc::new(vectors), upstream: client, metrics: Arc::new(Metrics::new()),
-        })
-    }
-
-    pub fn metrics(&self) -> Arc<Metrics> { Arc::clone(&self.metrics) }
-}
-
-pub fn router(state: AppState) -> Router {
-    let body_limit = state.config.max_request_bytes;
-    Router::new()
-        .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
-        .route("/readyz", get(|| async { StatusCode::NO_CONTENT }))
-        .route("/v1/chat/completions", post(chat_completions))
-        .layer(DefaultBodyLimit::max(body_limit))
-        .with_state(state)
-}
-
-async fn chat_completions(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<ChatCompletionRequest>,
-) -> Result<Response, ProxyError> {
-    let started = Instant::now();
-    validate_request(&request)?;
-
-    let injected = detect_fault(&headers, &state.config);
-    match injected {
-        Some(FaultKind::RateLimit) => {
-            state.metrics.event(OperationalEvent::FaultInjected("429"));
-            state.metrics.record(started.elapsed(), None);
-            return Ok(json_error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", "rate_limit_exceeded", "Rate limit exceeded (AegisLLM test fault).", Some("2")));
-        }
-        Some(FaultKind::ContextLength) => {
-            state.metrics.event(OperationalEvent::FaultInjected("400-context"));
-            state.metrics.record(started.elapsed(), None);
-            return Ok(json_error_response(StatusCode::BAD_REQUEST, "invalid_request_error", "context_length_exceeded", "Request exceeds the configured context length.", None));
-        }
-        Some(FaultKind::DisconnectAfterTenChunks) if !request.stream => {
-            return Err(ProxyError::BadRequest("disconnect-10 fault requires stream=true"));
-        }
-        _ => {}
-    }
-
-    let prompt = serde_json::to_string(&request.messages)?;
-    let embedding = state.embedder.embed(&prompt).await?;
-    let eligible = state.config.semantic_cache_enabled
-        && !request.stream
-        && request.temperature.unwrap_or(0.0) == 0.0;
-    let fingerprint = policy_fingerprint(&request)?;
-
-    if eligible {
-        if let Some(hit) = state.vectors.query(&embedding, &request.model, &fingerprint) {
-            state.metrics.record(started.elapsed(), Some(true));
-            state.metrics.event(OperationalEvent::CacheHit);
-            let mut response = Response::new(Body::from(hit.response));
-            response.headers_mut().insert("x-proxy-cache", HeaderValue::from_static("HIT-Semantic"));
-            response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            return Ok(response);
-        }
-    }
-    state.metrics.event(OperationalEvent::CacheMiss);
-
-    let endpoint = format!("{}/v1/chat/completions", state.config.upstream_base_url.trim_end_matches('/'));
-    let mut upstream_req = state.upstream.post(endpoint).json(&request);
-    if let Some(token) = state.config.upstream_bearer_token.as_deref() {
-        upstream_req = upstream_req.bearer_auth(token);
-    }
-
-    let upstream = match upstream_req.send().await {
-        Ok(response) => response,
-        Err(error) => {
-            state.metrics.event(OperationalEvent::UpstreamFailure);
-            state.metrics.record(started.elapsed(), Some(false));
-            return Err(ProxyError::Upstream(error));
-        }
-    };
-    let status = upstream.status();
-    let upstream_headers = upstream.headers().clone();
-
-    if request.stream {
-        let chunks = upstream.bytes_stream();
-        let stream = if matches!(injected, Some(FaultKind::DisconnectAfterTenChunks)) {
-            state.metrics.event(OperationalEvent::FaultInjected("disconnect-10"));
-            Box::pin(chunks.take(10)) as futures_util::stream::BoxStream<'static, Result<Bytes, reqwest::Error>>
-        } else {
-            Box::pin(chunks) as futures_util::stream::BoxStream<'static, Result<Bytes, reqwest::Error>>
-        };
-        let body_stream = stream.map(|chunk| chunk.map_err(std::io::Error::other));
-        let mut response = Response::new(Body::from_stream(body_stream));
-        *response.status_mut() = status;
-        copy_safe_headers(&upstream_headers, response.headers_mut());
-        state.metrics.record(started.elapsed(), Some(false));
-        return Ok(response);
-    }
-
-    let body = upstream.bytes().await?;
-    if eligible && status.is_success() && serde_json::from_slice::<Value>(&body).is_ok() {
-        let key = cache_key(&request, &prompt);
-        state.vectors.insert(key, embedding, body.clone(), request.model.clone(), fingerprint);
-        state.metrics.event(OperationalEvent::CacheInsert);
-    }
-    let mut response = Response::new(Body::from(body));
-    *response.status_mut() = status;
-    copy_safe_headers(&upstream_headers, response.headers_mut());
-    response.headers_mut().insert("x-proxy-cache", HeaderValue::from_static("MISS-Semantic"));
-    state.metrics.record(started.elapsed(), Some(false));
-    Ok(response)
-}
-
-fn validate_request(request: &ChatCompletionRequest) -> Result<(), ProxyError> {
-    if request.model.trim().is_empty() { return Err(ProxyError::BadRequest("model is required")); }
-    if request.messages.is_empty() { return Err(ProxyError::BadRequest("messages must not be empty")); }
-    if request.temperature.is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value)) {
-        return Err(ProxyError::BadRequest("temperature must be finite and between 0 and 2"));
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FaultKind { RateLimit, ContextLength, DisconnectAfterTenChunks }
-
-fn detect_fault(headers: &HeaderMap, config: &AegisConfig) -> Option<FaultKind> {
-    if !config.fault_injection_enabled { return None; }
-    let expected = config.fault_injection_secret.as_deref()?.as_bytes();
-    let supplied = headers.get(FAULT_SECRET_HEADER)?.as_bytes();
-    if !bool::from(expected.ct_eq(supplied)) { return None; }
-    match headers.get(FAULT_HEADER)?.to_str().ok()? {
-        "429" => Some(FaultKind::RateLimit),
-        "400-context" => Some(FaultKind::ContextLength),
-        "disconnect-10" => Some(FaultKind::DisconnectAfterTenChunks),
-        _ => None,
+        let vectors = VectorStore::new(config.max_cache_entries, Duration::from_secs(config.cache_ttl_seconds), config.similarity_threshold)?;
+        let faults = FaultConfig { enabled: config.fault_injection_enabled, secret: config.fault_injection_secret.clone() };
+        Ok(Self { config: Arc::new(config), embedder: Arc::new(embedder), vectors: Arc::new(vectors), upstream, metrics: Arc::new(Metrics::new()), faults })
     }
 }
 
-fn json_error_response(status: StatusCode, error_type: &str, code: &str, message: &str, retry_after: Option<&'static str>) -> Response {
-    let body = serde_json::json!({"error":{"type":error_type,"code":code,"message":message}});
-    let mut response = Response::new(Body::from(body.to_string()));
-    *response.status_mut() = status;
-    response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    if let Some(value) = retry_after { response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static(value)); }
-    response
-}
-
-fn copy_safe_headers(from: &HeaderMap, to: &mut HeaderMap) {
-    for name in [header::CONTENT_TYPE, header::CACHE_CONTROL] {
-        if let Some(value) = from.get(&name) { to.insert(name, value.clone()); }
-    }
-}
-
-fn policy_fingerprint(request: &ChatCompletionRequest) -> Result<[u8; 32], AegisError> {
-    let mut compatible = request.clone();
-    compatible.messages.clear();
-    compatible.stream = false;
-    let bytes = serde_json::to_vec(&compatible)?;
-    let digest = Sha256::digest(bytes);
-    let mut result = [0_u8; 32];
-    result.copy_from_slice(&digest);
-    Ok(result)
-}
-
-fn cache_key(request: &ChatCompletionRequest, prompt: &str) -> String {
-    let mut hash = Sha256::new();
-    hash.update(request.model.as_bytes());
-    hash.update(prompt.as_bytes());
-    hash.update(request.temperature.unwrap_or(0.0).to_bits().to_le_bytes());
-    format!("{:x}", hash.finalize())
-}
-
-#[derive(Debug, Error)]
-enum ProxyError {
-    #[error("bad request: {0}")]
-    BadRequest(&'static str),
-    #[error(transparent)]
-    Aegis(#[from] AegisError),
-    #[error(transparent)]
-    Upstream(#[from] reqwest::Error),
-    #[error(transparent)]
-    Serialization(#[from] serde_json::Error),
-}
-
-impl IntoResponse for ProxyError {
-    fn into_response(self) -> Response {
-        let (status, message) = match &self {
-            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, (*message).to_owned()),
-            Self::Aegis(AegisError::InvalidRequest(message)) => (StatusCode::BAD_REQUEST, message.clone()),
-            Self::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream request failed".to_owned()),
-            _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal proxy error".to_owned()),
-        };
-        tracing::error!(error = %self, "request failed");
-        (status, Json(serde_json::json!({"error":{"message":message}}))).into_response()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct TestBackend;
-    impl EmbeddingBackend for TestBackend {
-        fn embed_blocking(&self, text: &str) -> Result<Vec<f32>, AegisError> {
-            let mut vector = vec![0.0; EMBEDDING_DIMENSION];
-            for (index, byte) in text.bytes().enumerate() {
-                vector[index % EMBEDDING_DIMENSION] += f32::from(byte);
-            }
-            let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
-            if norm > 0.0 { for value in &mut vector { *value /= norm; } }
-            Ok(vector)
-        }
-    }
-
-    #[test]
-    fn cosine_similarity_handles_equal_and_invalid_dimensions() {
-        assert!((calculate_cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
-        assert_eq!(calculate_cosine_similarity(&[1.0], &[1.0, 2.0]), 0.0);
-        assert_eq!(calculate_cosine_similarity(&[0.0], &[0.0]), 0.0);
-    }
-
-    #[test]
-    fn config_defaults_disable_cache_and_fault_injection() {
-        let config = AegisConfig::default();
-        assert!(!config.semantic_cache_enabled);
-        assert!(!config.fault_injection_enabled);
-        assert!(config.validate().is_ok());
-    }
-
-    #[tokio::test]
-    async fn embedder_checks_dimension_and_normalizes_input() {
-        let embedder = SemanticEmbedder::new(Arc::new(TestBackend));
-        let vector = embedder.embed("  hello  ").await.expect("test embedding");
-        assert_eq!(vector.len(), EMBEDDING_DIMENSION);
-        assert!(embedder.embed("  ").await.is_err());
-    }
-}
+/// Shared metric channel types are exposed here for external monitor consumers.
+pub type SnapshotReceiver = watch::Receiver<MetricsSnapshot>;
+pub type EventReceiver = broadcast::Receiver<OperationalEvent>;
