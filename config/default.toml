@@ -1,0 +1,18 @@
+bind_addr = "127.0.0.1:8080"
+upstream_base_url = "https://api.openai.com"
+upstream_bearer_token = ""
+semantic_cache_enabled = false
+similarity_threshold = 0.96
+max_cache_entries = 10000
+cache_ttl_seconds = 3600
+max_request_bytes = 2097152
+request_timeout_seconds = 120
+fault_injection_enabled = false
+fault_injection_secret = ""
+embedding_model_path = "models/all-MiniLM-L6-v2.onnx"
+tokenizer_path = "models/tokenizer.json"
+# Set these to the exact SHA-256 checksums of your locally obtained artifacts.
+embedding_model_sha256 = ""
+tokenizer_sha256 = ""
+embedding_max_tokens = 256
+dashboard_enabled = false
